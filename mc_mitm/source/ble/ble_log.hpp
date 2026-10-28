@@ -24,4 +24,7 @@ namespace ams::ble::log {
     bool IsEnabled();
     void Write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+    // Hex dump of up to 48 bytes, for event payloads whose layout isn't known
+    void WriteHex(const char *label, const void *data, size_t size);
+
 }

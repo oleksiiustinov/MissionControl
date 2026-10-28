@@ -53,6 +53,10 @@ namespace ams::ble {
         constexpr TimeSpan PairingRetryBackoff = TimeSpan::FromSeconds(30);
         constinit s64 g_pairing_failed_tick = 0;
 
+        // Alternates after each refused pairing: ask the stack to bond up front, or leave it to the authenticated
+        // GATT reads (the pad may then answer with its own security request, which some pads insist on)
+        constinit bool g_bond_via_reads = false;
+
         /* The controller currently presented to the system */
         constinit os::SdkMutex g_controller_lock;
         std::shared_ptr<controller::BleGamepad> g_controller;
@@ -361,7 +365,13 @@ namespace ams::ble {
 
         // The stack never pairs on its own: an authenticated request on an unbonded link just fails. Pairing is
         // Just Works and needs no confirmation from the controller.
+        //
+        // A pad that accepts takes a few seconds to complete; one that refuses (e.g. a Stadia controller) has the
+        // completion event raised within milliseconds, which is a refusal even though the link stays up.
+        constexpr TimeSpan MinPlausiblePairingTime = TimeSpan::FromMilliSeconds(300);
+
         bool Pair(const bluetooth::Address &address) {
+            const auto start = os::GetSystemTick().ToTimeSpan();
             Result rc = btdrvCreateBond(address, BondTransport_Le);
             log::Write("btdrvCreateBond rc=0x%x", rc.GetValue());
             if (R_FAILED(rc)) {
@@ -370,19 +380,25 @@ namespace ams::ble {
 
             // The link-state event that reports the outcome is the same for success (~5 s) and refusal (at once,
             // followed by the stack dropping the link)
-            const auto deadline = os::GetSystemTick().ToTimeSpan() + TimeSpan::FromSeconds(10);
+            const auto deadline = start + TimeSpan::FromSeconds(10);
             while (os::GetSystemTick().ToTimeSpan() < deadline) {
                 events::Pump(TimeSpan::FromMilliSeconds(200));
                 if (events::IsDisconnected()) {
                     break;
                 }
                 if (events::TakeBondComplete()) {
+                    const auto elapsed = os::GetSystemTick().ToTimeSpan() - start;
+                    log::Write("bond event after %ld ms", elapsed.GetMilliSeconds());
                     events::Pump(TimeSpan::FromSeconds(1));
-                    if (!events::IsDisconnected()) {
-                        log::Write("paired");
-                        return true;
+                    if (events::IsDisconnected()) {
+                        break;
                     }
-                    break;
+                    if (elapsed < MinPlausiblePairingTime + TimeSpan::FromMilliSeconds(200)) {
+                        log::Write("bond event came too quickly, treating as refused");
+                        break;
+                    }
+                    log::Write("paired");
+                    return true;
                 }
             }
             log::Write("pairing failed");
@@ -530,7 +546,10 @@ namespace ams::ble {
 
                 gatt::Discover(conn_id, address);
 
-                if (!Pair(address)) {
+                const bool bond_via_reads = g_bond_via_reads;
+                log::Write("pairing strategy: %s", bond_via_reads ? "authenticated reads" : "CreateBond");
+                if (!bond_via_reads && !Pair(address)) {
+                    g_bond_via_reads = true;
                     g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                     log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
                     Disconnect();
@@ -550,6 +569,10 @@ namespace ams::ble {
                 rc = gatt::Subscribe(conn_id, &hid);
                 if (R_FAILED(rc)) {
                     log::Write("subscription failed rc=0x%x gatt_result=%u", rc.GetValue(), events::GetGattFailure());
+                    if (bond_via_reads) {
+                        g_bond_via_reads = false;
+                        g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
+                    }
                     Disconnect();
                     os::SleepThread(TimeSpan::FromSeconds(1));
                     continue;

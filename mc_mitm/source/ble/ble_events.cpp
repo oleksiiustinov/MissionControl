@@ -202,6 +202,7 @@ namespace ams::ble::events {
             }
 
             log::Write("core evt Connection type=%u for the controller", connection.type);
+            log::WriteHex("  raw", info, 0x30);
             LogAddress("  address", connection.addr);
             if (connection.type == CoreConnectionType_Suspended) {
                 std::scoped_lock lk(g_lock);
@@ -486,6 +487,7 @@ namespace ams::ble::events {
                 break;
             default:
                 log::Write("evt type=%u", static_cast<u32>(e.type));
+                log::WriteHex("  raw", &info, 0x30);
                 break;
         }
 

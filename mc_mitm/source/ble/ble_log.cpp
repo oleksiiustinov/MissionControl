@@ -102,4 +102,20 @@ namespace ams::ble::log {
         WriteLine(n);
     }
 
+    void WriteHex(const char *label, const void *data, size_t size) {
+        if (!g_enabled) {
+            return;
+        }
+
+        char hex[48 * 3 + 1];
+        const u8 *bytes = static_cast<const u8 *>(data);
+        const size_t count = std::min<size_t>(size, 48);
+        size_t n = 0;
+        for (size_t i = 0; i < count; ++i) {
+            n += std::snprintf(hex + n, sizeof(hex) - n, "%02x ", bytes[i]);
+        }
+        hex[n] = '\0';
+        Write("%s: %s", label, hex);
+    }
+
 }
