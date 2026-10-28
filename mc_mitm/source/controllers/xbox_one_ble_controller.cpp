@@ -43,6 +43,11 @@ namespace ams::controller {
         R_RETURN(XboxOneController::HandleDataReportEvent(&m_event_info));
     }
 
+    Result XboxOneBleController::SendNeutralReport() {
+        u8 neutral[sizeof(XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
+        R_RETURN(this->HandleInputReport(neutral, sizeof(neutral)));
+    }
+
     void XboxOneBleController::ProcessInputData(const bluetooth::HidReport *report) {
         XboxOneController::ProcessInputData(report);
 

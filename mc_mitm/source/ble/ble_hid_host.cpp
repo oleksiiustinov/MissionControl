@@ -23,6 +23,7 @@
 #include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "../controllers/controller_management.hpp"
 #include "../controllers/xbox_one_ble_controller.hpp"
+#include "../controllers/stadia_ble_controller.hpp"
 
 namespace ams::ble {
 
@@ -54,7 +55,12 @@ namespace ams::ble {
 
         /* The controller currently presented to the system */
         constinit os::SdkMutex g_controller_lock;
-        std::shared_ptr<controller::XboxOneBleController> g_controller;
+        std::shared_ptr<controller::BleGamepad> g_controller;
+
+        enum class ControllerKind {
+            Xbox,
+            Stadia,
+        };
 
         /* Advertisement parsing */
 
@@ -92,9 +98,23 @@ namespace ams::ble {
             }
         }
 
-        // The name only travels in the scan response, which isn't always reported
-        bool IsXboxController(const AdvertisementSummary &summary) {
-            return (std::strncmp(summary.name, "Xbox", 4) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad));
+        // The name only travels in the scan response, which isn't always reported. A pad that only shows the
+        // gamepad appearance is taken for an Xbox controller, which is what this host was first written for.
+        bool IdentifyController(const AdvertisementSummary &summary, ControllerKind *out_kind) {
+            // Stadia controllers in Bluetooth mode advertise as "StadiaXXXX-xxxx"
+            if (std::strncmp(summary.name, "Stadia", 6) == 0) {
+                *out_kind = ControllerKind::Stadia;
+                return true;
+            }
+            if ((std::strncmp(summary.name, "Xbox", 4) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad))) {
+                *out_kind = ControllerKind::Xbox;
+                return true;
+            }
+            return false;
+        }
+
+        const char *GetKindName(ControllerKind kind) {
+            return kind == ControllerKind::Stadia ? "stadia" : "xbox";
         }
 
         /* LE HID event stream: notifications from services registered with RegisterGattHidDataPath, and the results
@@ -127,7 +147,7 @@ namespace ams::ble {
                 }
 
                 if ((notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
-                    std::shared_ptr<controller::XboxOneBleController> controller;
+                    std::shared_ptr<controller::BleGamepad> controller;
                     {
                         std::scoped_lock lk(g_controller_lock);
                         controller = g_controller;
@@ -223,7 +243,7 @@ namespace ams::ble {
 
         /* Finding and connecting the controller */
 
-        Result Scan(bluetooth::Address *out_address, TimeSpan duration) {
+        Result Scan(bluetooth::Address *out_address, ControllerKind *out_kind, TimeSpan duration) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -242,8 +262,9 @@ namespace ams::ble {
             }
 
             EventRecord e;
+            ControllerKind kind = ControllerKind::Xbox;
             // Ends early if a link came up by itself or the console is going to sleep
-            const bool found = events::WaitFor(events::InvalidType, duration, &e, [](const EventRecord &r) {
+            const bool found = events::WaitFor(events::InvalidType, duration, &e, [&kind](const EventRecord &r) {
                 if (r.type != BtdrvBleEventType_ScanResult) {
                     return events::HasAdoptedConnection() || !events::IsRadioEnabled();
                 }
@@ -252,7 +273,12 @@ namespace ams::ble {
                 }
                 AdvertisementSummary summary;
                 ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
-                return IsXboxController(summary);
+                const bool match = IdentifyController(summary, &kind);
+                if (summary.name[0] != '\0' || summary.has_appearance) {
+                    log::Write("scan: name='%s' appearance=%s0x%04x -> %s", summary.name, summary.has_appearance ? "" : "(none) ",
+                        summary.appearance, match ? GetKindName(kind) : "ignored");
+                }
+                return match;
             });
 
             static_cast<void>(btdrvStopBleScan());
@@ -266,7 +292,9 @@ namespace ams::ble {
             R_UNLESS(found, svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
+            *out_kind = kind;
             events::LogAddress("found controller", *out_address);
+            log::Write("controller type: %s", GetKindName(kind));
 
             if (log::IsEnabled()) {
                 SetSysBluetoothDevicesSettings settings;
@@ -363,29 +391,38 @@ namespace ams::ble {
 
         /* Presenting the controller to the system */
 
-        void Present(u32 conn_id, const bluetooth::Address &address, const gatt::HidService &hid) {
-            if (!hid.has_output_report) {
-                log::Write("no output Report characteristic, rumble unavailable");
-            }
-
-            auto controller = std::make_shared<controller::XboxOneBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
+        template<typename T>
+        void Attach(std::shared_ptr<T> controller) {
             {
                 std::scoped_lock lk(g_controller_lock);
                 g_controller = controller;
             }
             controller::AttachVirtualController(controller);
+        }
+
+        void Present(ControllerKind kind, u32 conn_id, const bluetooth::Address &address, const gatt::HidService &hid) {
+            if (!hid.has_output_report) {
+                log::Write("no output Report characteristic, rumble unavailable");
+            }
+
+            if (kind == ControllerKind::Stadia) {
+                Attach(std::make_shared<controller::StadiaBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id, hid.has_output_report));
+            } else {
+                Attach(std::make_shared<controller::XboxOneBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id));
+            }
             g_pairing_failed_tick = 0;
 
-            // hid registers a controller on the first input report, and the pad only reports when something is
-            // touched, so its resting state is delivered once here (sticks centred, nothing pressed)
-            u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
-            static_cast<void>(controller->HandleInputReport(neutral, sizeof(neutral)));
-
-            log::Write("controller presented to the system");
+            std::shared_ptr<controller::BleGamepad> controller;
+            {
+                std::scoped_lock lk(g_controller_lock);
+                controller = g_controller;
+            }
+            Result rc = controller->SendNeutralReport();
+            log::Write("controller presented to the system as %s, neutral report rc=0x%x", GetKindName(kind), rc.GetValue());
         }
 
         void Dismiss(const bluetooth::Address &address) {
-            std::shared_ptr<controller::XboxOneBleController> controller;
+            std::shared_ptr<controller::BleGamepad> controller;
             {
                 std::scoped_lock lk(g_controller_lock);
                 controller = std::move(g_controller);
@@ -467,10 +504,12 @@ namespace ams::ble {
 
                 bluetooth::Address address;
                 u32 conn_id = InvalidConnId;
+                // A controller that came up on its own was paired in this boot; keep the type it was found as
+                static ControllerKind kind = ControllerKind::Xbox;
 
                 bool connected = Adopt(&address, &conn_id);
                 if (!connected && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive()) {
-                    Result rc = Scan(&address, TimeSpan::FromSeconds(10));
+                    Result rc = Scan(&address, &kind, TimeSpan::FromSeconds(10));
                     if (Adopt(&address, &conn_id)) {
                         connected = true;
                     } else if (R_SUCCEEDED(rc)) {
@@ -516,7 +555,7 @@ namespace ams::ble {
                     continue;
                 }
 
-                Present(conn_id, address, hid);
+                Present(kind, conn_id, address, hid);
                 RunConnected(conn_id);
 
                 // Nothing beyond the teardown is asked of the stack once the link is gone: removing the bond and
