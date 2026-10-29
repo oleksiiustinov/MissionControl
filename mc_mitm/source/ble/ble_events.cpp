@@ -67,6 +67,7 @@ namespace ams::ble::events {
 
         constinit s64 g_inquiry_started_tick = 0;
         constinit bool g_bond_complete = false;
+        constinit bool g_security_requested = false;
 
         constinit Sink g_sink = nullptr;
 
@@ -186,11 +187,34 @@ namespace ams::ble::events {
         if (type == BtdrvEventType_SspRequest) {
             auto &request = info->ssp_request.v12;
             if (is_ours(request.addr)) {
+                log::Write("core evt SspRequest for the controller");
+                log::WriteHex("  raw", info, 0x20);
+                {
+                    std::scoped_lock lk(g_lock);
+                    g_security_requested = true;
+                }
                 Result rc = btdrvRespondToSspRequest(request.addr, SspVariant_PasskeyConfirmation, true, request.passkey);
                 log::Write("btdrvRespondToSspRequest(accept) rc=0x%x", rc.GetValue());
                 return true;
             }
             return false;
+        }
+
+        if (type == BtdrvEventType_PairingPinCodeRequest) {
+            if (is_ours(info->pairing_pin_code_request.addr)) {
+                log::Write("core evt PairingPinCodeRequest for the controller");
+                log::WriteHex("  raw", info, 0x20);
+                std::scoped_lock lk(g_lock);
+                g_security_requested = true;
+            }
+            return false;
+        }
+
+        // Anything else while one of our attempts is under way, in case the stack reports the pad's security
+        // request or the pairing outcome some other way (inquiry results are left out, they are btm's and many)
+        if ((have_target || have_claimed) && (type != BtdrvEventType_InquiryDevice) && (type != BtdrvEventType_Connection)) {
+            log::Write("core evt type=%u during attempt", type);
+            log::WriteHex("  raw", info, 0x30);
         }
 
         if (type == BtdrvEventType_Connection) {
@@ -253,6 +277,7 @@ namespace ams::ble::events {
         }
         g_disconnected = false;
         g_bond_complete = false;
+        g_security_requested = false;
     }
 
     bool GetTarget(bluetooth::Address *out) {
@@ -360,6 +385,18 @@ namespace ams::ble::events {
     bool IsPairingWindowOpen() {
         std::scoped_lock lk(g_lock);
         return g_inquiry_started_tick != 0;
+    }
+
+    bool TakeSecurityRequested() {
+        std::scoped_lock lk(g_lock);
+        const bool requested = g_security_requested;
+        g_security_requested = false;
+        return requested;
+    }
+
+    bool PeekBondComplete() {
+        std::scoped_lock lk(g_lock);
+        return g_bond_complete;
     }
 
     bool TakeBondComplete() {

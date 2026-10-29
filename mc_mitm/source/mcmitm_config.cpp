@@ -41,7 +41,10 @@ namespace ams::mitm {
             },
             .ble = {
                 .enable = false,
-                .log = false
+                .log = false,
+                .keep_bond = false,
+                .bond_delay_ms = 0,
+                .pair_mode = 0
             }
         };
 
@@ -120,6 +123,18 @@ namespace ams::mitm {
                     ParseBoolean(value, &config->ble.enable);
                 } else if (strcasecmp(name, "log") == 0) {
                     ParseBoolean(value, &config->ble.log);
+                } else if (strcasecmp(name, "keep_bond") == 0) {
+                    ParseBoolean(value, &config->ble.keep_bond);
+                } else if (strcasecmp(name, "bond_delay_ms") == 0) {
+                    ParseInt(value, &config->ble.bond_delay_ms, 0, 15000);
+                } else if (strcasecmp(name, "pair_mode") == 0) {
+                    if (strcasecmp(value, "auto") == 0) {
+                        config->ble.pair_mode = 0;
+                    } else if (strcasecmp(value, "bond") == 0) {
+                        config->ble.pair_mode = 1;
+                    } else if (strcasecmp(value, "wait") == 0) {
+                        config->ble.pair_mode = 2;
+                    }
                 }
             } else {
                 return 0;

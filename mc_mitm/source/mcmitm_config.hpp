@@ -42,6 +42,10 @@ namespace ams::mitm {
         struct {
             bool enable;
             bool log;
+            // Experiments for controllers whose pairing fails (Stadia)
+            bool keep_bond;         // don't remove the stack's record of the pad before connecting
+            int bond_delay_ms;      // wait this long after connecting before asking to pair
+            int pair_mode;          // 0 = auto (alternate), 1 = always CreateBond, 2 = never CreateBond (wait for the pad)
         } ble;
     };
 

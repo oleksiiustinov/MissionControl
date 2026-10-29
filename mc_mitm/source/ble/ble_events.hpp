@@ -66,6 +66,9 @@ namespace ams::ble::events {
 
     // Set when the stack reports the bond with the target complete (core Connection event)
     bool TakeBondComplete();
+    bool PeekBondComplete();
+    // An SSP or PIN request for the pad arrived, i.e. pairing got under way without us asking
+    bool TakeSecurityRequested();
 
     // The console's sleep state (from the psc power module): no radio activity is allowed while asleep
     void SetRadioEnabled(bool enabled);

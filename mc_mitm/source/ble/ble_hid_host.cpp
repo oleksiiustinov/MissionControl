@@ -334,8 +334,13 @@ namespace ams::ble {
 
             // A record left for this address, including the one a classic firmware left behind, is encrypted
             // with the moment the link comes up, and the controller drops the link over a key it doesn't hold
-            Result rc = btdrvRemoveBond(address);
-            log::Write("btdrvRemoveBond rc=0x%x", rc.GetValue());
+            Result rc = ResultSuccess();
+            if (mitm::GetGlobalConfig()->ble.keep_bond) {
+                log::Write("keep_bond: not removing the stored record");
+            } else {
+                rc = btdrvRemoveBond(address);
+                log::Write("btdrvRemoveBond rc=0x%x", rc.GetValue());
+            }
 
             rc = btdrvConnectGattServer(g_client_if, address, true, 0);
             log::Write("btdrvConnectGattServer rc=0x%x", rc.GetValue());
@@ -546,12 +551,53 @@ namespace ams::ble {
 
                 gatt::Discover(conn_id, address);
 
-                const bool bond_via_reads = g_bond_via_reads;
-                log::Write("pairing strategy: %s", bond_via_reads ? "authenticated reads" : "CreateBond");
-                if (!bond_via_reads && !Pair(address)) {
-                    g_bond_via_reads = true;
+                const auto config = mitm::GetGlobalConfig();
+                const bool bond_via_reads = (config->ble.pair_mode == 2) || ((config->ble.pair_mode == 0) && g_bond_via_reads);
+                log::Write("settings: pair_mode=%d keep_bond=%d bond_delay_ms=%d; this attempt: %s", config->ble.pair_mode,
+                    config->ble.keep_bond, config->ble.bond_delay_ms, bond_via_reads ? "wait for the pad" : "CreateBond");
+
+                // Let the pad's connection parameter update and any security request of its own play out first
+                if (config->ble.bond_delay_ms > 0) {
+                    log::Write("waiting %d ms before pairing", config->ble.bond_delay_ms);
+                    events::Pump(TimeSpan::FromMilliSeconds(config->ble.bond_delay_ms));
+                }
+
+                if (events::TakeSecurityRequested()) {
+                    log::Write("the stack reported pairing traffic for the pad before we asked for it");
+                }
+
+                if (bond_via_reads) {
+                    // Leave security to the pad and the stack: wait for a pairing outcome, then try the reads anyway
+                    const auto start = os::GetSystemTick().ToTimeSpan();
+                    while ((os::GetSystemTick().ToTimeSpan() - start) < TimeSpan::FromSeconds(10)) {
+                        events::Pump(TimeSpan::FromMilliSeconds(200));
+                        if (events::IsDisconnected() || events::PeekBondComplete()) {
+                            break;
+                        }
+                    }
+                    log::Write("waited %ld ms: bond event=%d disconnected=%d security traffic=%d",
+                        (os::GetSystemTick().ToTimeSpan() - start).GetMilliSeconds(), events::TakeBondComplete(),
+                        events::IsDisconnected(), events::TakeSecurityRequested());
+                } else if (events::PeekBondComplete()) {
+                    log::Write("a pairing outcome already arrived, not asking again");
+                    static_cast<void>(events::TakeBondComplete());
+                } else if (!Pair(address)) {
+                    if (config->ble.pair_mode == 0) {
+                        g_bond_via_reads = true;
+                    }
                     g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                     log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
+                    Disconnect();
+                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    continue;
+                }
+
+                if (events::IsDisconnected()) {
+                    log::Write("pad dropped the link before subscribing");
+                    g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
+                    if (config->ble.pair_mode == 0) {
+                        g_bond_via_reads = !g_bond_via_reads;
+                    }
                     Disconnect();
                     os::SleepThread(TimeSpan::FromSeconds(1));
                     continue;
@@ -570,7 +616,9 @@ namespace ams::ble {
                 if (R_FAILED(rc)) {
                     log::Write("subscription failed rc=0x%x gatt_result=%u", rc.GetValue(), events::GetGattFailure());
                     if (bond_via_reads) {
-                        g_bond_via_reads = false;
+                        if (config->ble.pair_mode == 0) {
+                            g_bond_via_reads = false;
+                        }
                         g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                     }
                     Disconnect();
